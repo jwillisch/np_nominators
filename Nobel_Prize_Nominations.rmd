@@ -1,0 +1,221 @@
+---
+title: "Code Sample"
+author: "Jakob Willisch"
+date: "August 14, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+```
+
+### Nobel Prize Nomination Data
+The Nobel Prize Committee publishes information about its Laureates regularly and makes the information available through a public [API](https://nobelprize.readme.io/v1.0). Yet, according to the [Statutes of the Nobel Foundation](http://www.nobelprize.org/nobel_organizations/nobelfoundation/statutes.html#par7), information on who nominated whom and why is released only with a 50 year time-lag and not yet via a public API. The selection pool of elligible nominators is comparably small and potentially homogenous for most nobel prizes, but the [selection process of the Nobel Peace Prize](https://www.nobelprize.org/nomination/peace/index.html) considers nominations from a considerably larger pool of nominators. 
+
+The aim of this project is to scrape the [Nobel Prize Nomination Database](https://www.nobelprize.org/nomination/archive/), visualize some basic findings from the data and make the database available in a publically accessible format.
+
+## Scraper
+This part of this file presents the commented code for the scraper.
+
+```{r scrape fun}
+scrape_nobel <- function(prize, yearFrom=1901, yearEnd, url="https://www.nobelprize.org/nomination/archive/list.php"){
+  require(magrittr)
+  # establish connection and store nomination links
+  session <- rvest::html_session(url=url)
+  form<- rvest::html_form(session)
+  form_filled <- list()
+  for(i in 1:length(seq(yearFrom,yearEnd))) {
+    form_filled[[i]] <- rvest::set_values(form[[5]],prize=paste(prize),year=paste(i+1900))
+  }
+  
+  link_pages <- suppressMessages(lapply(form_filled, function(x) session %>% 
+                                          rvest::submit_form(form=x)))
+  
+  num_nom <- sapply(link_pages, function(x) rvest::html_node(x,"#main p") %>% 
+                      rvest::html_text() %>% 
+                      gsub(pattern="(\\d+).+",replacement="\\1") %>% 
+                      as.numeric())
+  
+  links <- unlist(sapply(link_pages, function(x) rvest::html_nodes(x, ".butt") %>% 
+                           rvest::html_attr("href")))
+  
+  # paste function that does not coerce NA to string (credits to Ben Bolker: https://stackoverflow.com/users/190277/ben-bolker))
+  paste2 <- function(...,sep="") {
+    L <- list(...)
+    L <- lapply(L,function(x) {x[is.na(x)] <- ""; x})
+    ret <-gsub(paste0("(^",sep,"|",sep,"$)"),"",
+               gsub(paste0(sep,sep),sep,
+                    do.call(paste,c(L,list(sep=sep)))))
+    ret
+  }
+  
+  # retrieve and clean nomination tables
+  ret_shape <- function(link) {
+    # retrieve df from html-table and clean
+    df <- rvest::jump_to(session,link) %>% rvest::html_nodes("table") %>% rvest::html_table() %>% as.data.frame()
+
+    df_cleaned <- df[!apply(df, 1, function(x) any(stringr::str_detect(x,"^(?:[[:space:]]|Nomination.+|(?![\\s\\S]))$"))),]
+    df_cleaned$X1 <- stringr::str_replace(df_cleaned$X1,":","") %>%
+      stringr::str_replace(", ","") %>% 
+      stringr::str_replace("^Awarded.+(Physics|Chemistry|Medicine|Literature|Peace).+$","\\1award") %>%
+      stringr::str_to_lower()
+    df_cleaned$X2 <- stringr::str_replace(df_cleaned$X2,"^Awarded.+(\\d{4})","\\1")
+    
+    year <- df_cleaned[df_cleaned[,1]=="year",2]
+    remove <- stringr::str_detect(df_cleaned[,1],"^(?:nomin(?:ee|ator).*+|year$)")
+    
+    # identify individuals within nomination and shared prizes
+    id_raw <- stringr::str_replace(df_cleaned[,1],"^nominee(?:$| (\\d+))","nom\\1") %>% 
+      stringr::str_replace("^nominator(?:$| (\\d+))","prop\\1") %>% 
+      stringr::str_replace("^(nom|prop)$","\\11") %>%
+      stringr::str_extract("^(?:nom\\d+|prop\\d+)$") %>%
+      zoo::na.locf(na.rm=F)
+    
+    df_indexed <- df_cleaned[!remove,]
+    df_indexed$nom.id <- as.numeric(stringr::str_extract(link,"\\d+"))
+    df_indexed$ind.id <- zoo::na.locf(id_raw,fromLast=T,na.rm=F)[!remove]
+    df_indexed$year <- year
+    
+    shared <- suppressWarnings(stringr::str_match(id_raw,"^nom(\\d)") %>%
+                                 as.numeric()  %>%
+                                 max(na.rm=T))
+    
+    #control for duplicate variables 
+    dupl <- by(df_indexed[,1],list(df_indexed$nom.id,df_indexed$ind.id),duplicated,simplify=T) %>% 
+      unlist()
+    if(any(dupl)) {
+      print(paste0("Non-identifiable varname in ",link))
+      df_indexed[dupl,1] <- paste0(df_indexed[dupl,1],"_2")
+    }  
+
+    return(df_indexed)
+  }
+
+  # extracts tables from links 
+  nom_tables <- lapply(links, ret_shape)
+  
+  # setup to fill NAs for same individuals
+  cat <- c("physics", "chemistry", "medicine","literature", "peace")
+  fill_nom <- c("number")
+  fill_ind <- c("country","city","gender","yearbirth","yeardeath","state","university","comments","motivation")
+  varnames <- c("award")
+  varvals <- list(lazyeval::interp(~as.numeric(ifelse(is.na(ifelse(year==var,1,0)),0,ifelse(year==var,1,0)))
+                                   , var=as.name(paste0(cat[prize],"award"))
+                                   , qvar=paste0(cat[prize],"award")))
+  
+  # combine,merge and fill NAs
+  bind.noms <- function(x,y){rbind(x,y)}
+  DF <- Reduce(bind.noms,nom_tables) %>% 
+    reshape2::dcast(formula = year+nom.id+ind.id~X1,value.var= "X2") %>% 
+    dplyr::mutate_(.dots=setNames(varvals,varnames)) %>%
+    dplyr::group_by(year,nom.id) %>%
+    dplyr::mutate_at(.cols=fill_nom,.funs=zoo::na.locf,na.rm=F) %>%
+    dplyr::group_by(year,name) %>%
+    dplyr::mutate_at(.cols=fill_ind,.funs=zoo::na.locf,na.rm=F) %>%
+    dplyr::mutate_at(.cols=fill_ind,.funs=zoo::na.locf,na.rm=F,fromLast=T)%>%
+    dplyr::mutate(ind.id=stringr::str_replace(ind.id,"^(nom|prop)\\d+$","\\1"))
+    
+  #add nobel prize winners who awarded ex post
+  a_later <- c(1912,1925,1944,1954,1960,1965)
+  a_later.names<- c("Elihu  Root","Sir Joseph Austen  Chamberlain","Charles Gates  Dawes"
+                ,"The International Committee of the Red Cross"
+                ,"Office of the United Nations High Commissioner for Refugees"
+                ,"Albert J Luthuli"
+                ,"UNICEF (United Nations Children´s Fund)")
+  l_ids <- unique(DF[DF$year %in% paste(a_later+1) & DF$name %in% a_later.names,]$nom.id)
+  rlater <- DF[DF$nom.id %in% l_ids,]
+  rlater$year <- as.character(as.numeric(rlater$year)-1)
+  rlater$award <- ifelse(rlater$name %in% a_later.names & rlater$ind.id=="nom",1,0)
+  
+  DF <- DF %>% 
+    filter(!(nom.id %in% l_ids)) %>%
+    mutate(award=replace(award,name=="UNICEF (United Nations Children´s Fund)"&year=="1965",1)) %>%
+    mutate(award=replace(award,name=="Office of the United Nations High Commissioner for Refugees"&year=="1955",0)) %>%
+    rbind(rlater) %>%
+    as.data.frame()
+
+  return(DF)
+}
+```
+
+## Data Visualization
+This second part vizualizes some preliminary characteristics of the data for the Nobel Peace Prize. We first scrape the data (this may take a couple of minutes).
+
+```{r scrape}
+df <- scrape_nobel(prize=5, yearEnd=1967)
+```
+
+The output data is structured as follows. Each row represents a nominee or a nominator. Rows are not aggregated over years, so the number of rows in which an individual occurrs as a nominee is the number of nominations the individual received. I aggregate over the years in order to look at individuals per year as our unit of analysis and add time-ranges as well as a per-year rank according to the number of nominations that each nominee received (a rank of 1 corresponds to with the most nominations received in a given year).
+
+```{r aggregate}
+diff <- c("gender","yearbirth","yeardeath")
+df_ind <- df %>%
+  group_by(year,name)%>%
+  mutate(n.noms=sum(ind.id=="nom",na.rm=T),n.props=sum(ind.id=="prop",na.rm=T))%>%
+  group_by(year,name,ind.id)%>%
+  distinct_(.dots=diff,.keep_all=T) %>%
+  group_by(year)%>%
+  mutate(tot.noms=sum(n.noms),tot.props=sum(n.props))%>%
+  mutate(prop.noms=n.noms/tot.noms,prop.props=n.props/tot.props)%>%
+  mutate(rank.noms=rank(-prop.noms))%>%
+  as.data.frame()
+
+df_ind$year.range <- cut(as.numeric(df_ind$year)
+                     ,breaks=c(1900,1910,1920,1930,1940,1950,1960,1970)
+                     ,labels=c("1900-1910","1910-1920","1920-1930","1930-1940","1940-1950","1950-1960","1960-1970"))
+
+#check uniqueness of ids
+unique_id <- function(x, ...) {
+  id_set <- x %>% select(...)
+  id_set_dist <- id_set %>% distinct
+  if (nrow(id_set) == nrow(id_set_dist)) {
+    TRUE
+  } else {
+    non_unique_ids <- id_set %>% 
+      filter(id_set %>% duplicated) %>% 
+      distinct()
+    suppressMessages(
+      inner_join(non_unique_ids, x) %>% arrange(...)
+    )
+  }
+}
+df_ind %>% unique_id(year,name,ind.id)
+```
+
+# Awards by Nomination ranking
+The first question I explore visually is how important the nomination ranking is for being awarded the Peace prize. This plot shows the the ranks of those awarded the Nobel Peace Prize between 1901 and 1967.
+```{r awards by nom ranking}
+(award_rank <- ggplot(df_ind[df_ind$award==1,],aes(x=rank.noms)) + geom_bar() + xlab("Ranking by Number of Nominations") + ylab("Number of Awards") + theme_bw())
+```
+
+As one can see in this graph, most prizes were awarded to those individuals who ranked in the top 10 by received nominations. What is more surprising is the number of prizes awarded to individuals who ranked 20 or worse.
+
+# Award vs. No Award by Gender of the nominee
+Second I explore whether gender matters in terms of how the nomination rank differs between those who receive the prize and those who did not. This plot shows the distribution of ranks grouped by the nominees gender and whether the nominee was awarded the prize or not.
+
+```{r award_gender}
+(award_gender <- ggplot(df_ind[df_ind$ind.id=="nom",], aes(x=factor(award),y=rank.noms,color = factor(gender))) + stat_boxplot() + xlab("Prize Awarded") + ylab("Ranking by Number of Nominations") + theme_bw() + theme(legend.position = "bottom",legend.title=element_blank()))
+```
+
+As expected, those who were awarded prizes had a considerably lower ranking (more nominations) than those who were not awarded. More interestingly, the difference between female recipients and non-recipients seems to be larger than between male recipients and non-recipients. However, there are only three female recipients in our sample so any difference in means test should be treated with caution.
+
+# The Impact of Nominations on Awards over Time
+
+How does the importance of the number of nominations for being awarded change over time? This plot shows how the proportions of nominations for award-receiving vs. non-award-receveiving nominees changes over time.
+```{r award_time}
+(award_rank_time <- ggplot(df_ind, aes(x=year,y=prop.noms,fill = factor(award,label=c("awarded","not awarded"))))  + geom_bar(stat="identity",position = "stack") +xlab("Periods") + ylab("Proportions of Nominations") + theme_bw()  + theme(legend.position = "bottom",legend.title=element_blank(),axis.text.x = element_text(angle = 90, hjust = 1)))   
+```
+
+One may expect that the impact of the number of nominations dilutes if more individuals get nominated over time. Yet, the yearly proportion of nominations received by the award-winning nominee remained relatively stable over time.
+
+# Nominator Pool by Gender over Time
+Lastly let us explore how the gender distribution of the nominator pool changed over time. This graph shows the proportion of male to female nominators. Grey bars indicate individuals whose gender is unknown and organizations who are elligible to nominate.
+
+```{r prop_gender_time}
+(prop_gender <- ggplot(df_ind, aes(x=year,y=prop.props,fill = factor(gender))) + geom_bar(stat="identity",position = "stack")+ xlab("Year") + ylab("Proportion of Nominators") + theme_bw() + theme(legend.position = "bottom",legend.title=element_blank(),axis.text.x = element_text(angle = 90, hjust = 1)))
+```
+
+Perhaps not surprisigly, the gender distribution of the nominator pool is very skewed. Further, there does not seem to be a strong trend towards a more evenly distributed nominator pool.
+
